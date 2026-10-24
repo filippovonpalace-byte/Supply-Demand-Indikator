@@ -1,0 +1,171 @@
+//@version=6
+indicator("Supply & Demand Zones V4 - Blue Candidates", shorttitle="S&D Zones V4", overlay=true, max_boxes_count=300)
+
+// =====================================================
+// EINSTELLUNGEN
+// =====================================================
+string zoneMode = input.string("Preferred", "Zonengrenzen", options=["Preferred", "Wider"], group="Zonen")
+int maxBaseBars = input.int(5, "Maximale Base-Kerzen", minval=1, maxval=5, group="Zonen")
+int maxZones = input.int(70, "Maximale sichtbare Zonen", minval=1, maxval=200, group="Zonen")
+int rightPadding = input.int(20, "Rechtecke nach rechts (Bars)", minval=1, maxval=200, group="Zonen")
+
+bool showRBR = input.bool(true, "RBR", group="Formationen")
+bool showDBR = input.bool(true, "DBR", group="Formationen")
+bool showRBD = input.bool(true, "RBD", group="Formationen")
+bool showDBD = input.bool(true, "DBD", group="Formationen")
+
+float explosiveBody = input.float(0.70, "Explosive: Koerperanteil >", minval=0.50, maxval=0.99, step=0.01, group="Strenge Erkennung")
+float baseBody = input.float(0.50, "Base: Koerperanteil <=", minval=0.05, maxval=0.70, step=0.01, group="Strenge Erkennung")
+int averageLength = input.int(10, "Vergleichskerzen", minval=3, maxval=100, group="Strenge Erkennung")
+float explosiveFactor = input.float(1.50, "Explosive: Range-Faktor", minval=1.0, maxval=5.0, step=0.05, group="Strenge Erkennung")
+bool requireDeparture = input.bool(true, "Leg-out schliesst ausserhalb Base", group="Strenge Erkennung")
+
+bool showBlue = input.bool(true, "Blaue Kandidaten anzeigen", group="Blaue Kandidaten")
+float candidateBaseBody = input.float(0.60, "Kandidat: Base Koerperanteil bis", minval=0.50, maxval=0.80, step=0.01, group="Blaue Kandidaten")
+float candidateFactor = input.float(1.20, "Kandidat: Range-Faktor ab", minval=1.0, maxval=5.0, step=0.05, group="Blaue Kandidaten")
+
+float deleteDepth = input.float(20.0, "Zone loeschen ab Eindringtiefe (%)", minval=1.0, maxval=100.0, step=1.0, group="Fresh und Loeschung")
+
+color supplyColor = input.color(color.rgb(210, 45, 45), "Supply (streng)", group="Darstellung")
+color demandColor = input.color(color.rgb(25, 160, 85), "Demand (streng)", group="Darstellung")
+color blueColor = input.color(color.rgb(35, 115, 225), "Kandidaten (beide Richtungen)", group="Darstellung")
+int transparency = input.int(80, "Transparenz", minval=0, maxval=100, group="Darstellung")
+color captionColor = input.color(color.white, "Textfarbe", group="Darstellung")
+string textSizeInput = input.string("Tiny", "Textgroesse", options=["Tiny", "Small", "Normal"], group="Darstellung")
+string boxTextSize = textSizeInput == "Normal" ? size.normal : textSizeInput == "Small" ? size.small : size.tiny
+
+// =====================================================
+// HILFSFUNKTIONEN
+// =====================================================
+type SDZone
+    box shape
+    float top
+    float bottom
+    bool isSupply
+    bool untouched
+    string formation
+    int createdBar
+
+var array<SDZone> zones = array.new<SDZone>()
+
+f_bodyRatio(int offset) =>
+    float candleRange = high[offset] - low[offset]
+    candleRange > 0 ? math.abs(close[offset] - open[offset]) / candleRange : 0.0
+
+float avgRange = ta.sma(high - low, averageLength)
+
+f_explosive(int offset, float factor) =>
+    float candleSize = high[offset] - low[offset]
+    float reference = avgRange[offset + 1]
+    candleSize > 0 and f_bodyRatio(offset) > explosiveBody and not na(reference) and reference > 0 and candleSize >= reference * factor
+
+f_enabled(string name) =>
+    (name == "RBR" and showRBR) or (name == "DBR" and showDBR) or (name == "RBD" and showRBD) or (name == "DBD" and showDBD)
+
+f_caption(bool supply, string formation, bool untouched) =>
+    (supply ? "SUPPLY" : "DEMAND") + " (" + formation + ")" + (untouched ? " - FRESH" : "")
+
+// =====================================================
+// BESTEHENDE ZONEN VERWALTEN
+// Schon ein Docht mit 20 % Eindringtiefe loescht die Box.
+// Eine Beruehrung unter 20 % entfernt nur FRESH.
+// =====================================================
+int i = array.size(zones) - 1
+while i >= 0
+    SDZone z = array.get(zones, i)
+    if bar_index > z.createdBar
+        float height = z.top - z.bottom
+        bool overlaps = high >= z.bottom and low <= z.top
+        bool invalidBreak = z.isSupply ? close > z.top : close < z.bottom
+        bool deepTouch = z.isSupply ? (overlaps and high >= z.bottom + height * deleteDepth / 100.0) : (overlaps and low <= z.top - height * deleteDepth / 100.0)
+        if deepTouch or invalidBreak
+            box.delete(z.shape)
+            array.remove(zones, i)
+        else
+            if z.untouched and overlaps
+                z.untouched := false
+                box.set_text(z.shape, f_caption(z.isSupply, z.formation, false))
+                array.set(zones, i, z)
+            box.set_right(z.shape, bar_index + rightPadding)
+    else
+        box.set_right(z.shape, bar_index + rightPadding)
+    i -= 1
+
+// =====================================================
+// NEUE ZONEN ERKENNEN
+// Erster Suchdurchlauf: nur strenge rote/gruene Zonen.
+// Zweiter Suchdurchlauf: knapp verfehlte Kriterien = blau.
+// Bei blauen Zonen darf hoechstens EINE Art von Kriterium
+// (Base, Leg-in oder Leg-out) knapp verfehlt sein.
+// =====================================================
+if barstate.isconfirmed and bar_index > averageLength + maxBaseBars + 10
+    bool outUp = close > open
+    bool outDown = close < open
+    bool strictOut = f_explosive(0, explosiveFactor)
+    float weakerFactor = math.min(candidateFactor, explosiveFactor)
+    bool candidateOut = f_explosive(0, weakerFactor)
+    bool found = false
+
+    if (outUp or outDown) and candidateOut
+        for pass = 0 to 1
+            if not found and (pass == 0 or showBlue)
+                for n = 1 to maxBaseBars
+                    if not found
+                        float baseHigh = na
+                        float baseLow = na
+                        float bodyHigh = na
+                        float bodyLow = na
+                        bool strictBase = true
+                        bool candidateBase = true
+                        int weakBaseCandles = 0
+
+                        for b = 1 to n
+                            float ratio = f_bodyRatio(b)
+                            bool validRange = high[b] > low[b]
+                            if not validRange or ratio > baseBody
+                                strictBase := false
+                                weakBaseCandles += 1
+                            if not validRange or ratio > candidateBaseBody
+                                candidateBase := false
+
+                            baseHigh := na(baseHigh) ? high[b] : math.max(baseHigh, high[b])
+                            baseLow := na(baseLow) ? low[b] : math.min(baseLow, low[b])
+                            float bh = math.max(open[b], close[b])
+                            float bl = math.min(open[b], close[b])
+                            bodyHigh := na(bodyHigh) ? bh : math.max(bodyHigh, bh)
+                            bodyLow := na(bodyLow) ? bl : math.min(bodyLow, bl)
+
+                        int legIn = n + 1
+                        bool strictIn = f_explosive(legIn, explosiveFactor)
+                        bool candidateIn = f_explosive(legIn, weakerFactor)
+                        bool inUp = close[legIn] > open[legIn]
+                        bool inDown = close[legIn] < open[legIn]
+                        bool departureOK = not requireDeparture or (outUp and close > baseHigh) or (outDown and close < baseLow)
+                        bool structureOK = departureOK and (inUp or inDown)
+
+                        bool allStrict = strictBase and strictIn and strictOut
+                        int weakCategories = (strictBase ? 0 : 1) + (strictIn ? 0 : 1) + (strictOut ? 0 : 1)
+                        bool isCandidate = candidateBase and weakBaseCandles <= 1 and candidateIn and candidateOut and weakCategories == 1
+                        bool accepted = structureOK and (pass == 0 ? allStrict : isCandidate)
+
+                        if accepted
+                            bool supply = outDown
+                            string formation = supply ? (inUp ? "RBD" : "DBD") : (inUp ? "RBR" : "DBR")
+                            if f_enabled(formation)
+                                float zoneTop = supply ? baseHigh : (zoneMode == "Preferred" ? bodyHigh : baseHigh)
+                                float zoneBottom = supply ? (zoneMode == "Preferred" ? bodyLow : baseLow) : baseLow
+                                if zoneTop > zoneBottom
+                                    color c = pass == 1 ? blueColor : (supply ? supplyColor : demandColor)
+                                    box newBox = box.new(
+                                         left=bar_index - n, top=zoneTop,
+                                         right=bar_index + rightPadding, bottom=zoneBottom,
+                                         xloc=xloc.bar_index, bgcolor=color.new(c, transparency),
+                                         border_color=color.new(c, 10), border_width=1,
+                                         text=f_caption(supply, formation, true),
+                                         text_color=captionColor, text_size=boxTextSize,
+                                         text_halign=text.align_center, text_valign=text.align_center)
+                                    array.push(zones, SDZone.new(newBox, zoneTop, zoneBottom, supply, true, formation, bar_index))
+                                    if array.size(zones) > maxZones
+                                        SDZone oldest = array.shift(zones)
+                                        box.delete(oldest.shape)
+                                    found := true
